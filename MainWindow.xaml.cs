@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Windows;
 using System.Windows.Media;
@@ -28,6 +28,7 @@ public partial class MainWindow : Window
 
     private readonly DispatcherTimer _updateTimer;
     private bool _isDragging = false;
+    private int _lastDisplayedSeconds = -1;
 
     public MainWindow()
     {
@@ -93,7 +94,12 @@ public partial class MainWindow : Window
         {
             StopAudio();
 
-            string selectedDriver = DeviceComboBox.SelectedItem?.ToString()?.Replace("[ASIO] ", "");
+            string selectedDriver = (DeviceComboBox.SelectedItem as string)?.Replace("[ASIO] ", "");
+
+            if (string.IsNullOrEmpty(selectedDriver))
+            {
+                throw new InvalidOperationException("Bitte wählen Sie einen gültigen ASIO-Treiber.");
+            }
 
             _audioService.InitializeAsio(selectedDriver);
 
@@ -131,6 +137,7 @@ public partial class MainWindow : Window
     private void StopAudio()
     {
         _updateTimer.Stop();
+        _lastDisplayedSeconds = -1;
         _audioService?.CleanUp();
 
         if (_currentStream is not null)
@@ -147,8 +154,15 @@ public partial class MainWindow : Window
     {
         if (_currentStream is not null && !_isDragging)
         {
-            ProgressSlider.Value = _currentStream.CurrentTime.TotalSeconds;
-            TimeLabel.Text = $"{_currentStream.CurrentTime:mm\\:ss} / {_currentStream.TotalTime:mm\\:ss}";
+            var currentTime = _currentStream.CurrentTime;
+            ProgressSlider.Value = currentTime.TotalSeconds;
+
+            int currentSeconds = (int)currentTime.TotalSeconds;
+            if (currentSeconds != _lastDisplayedSeconds)
+            {
+                _lastDisplayedSeconds = currentSeconds;
+                TimeLabel.Text = $"{currentTime:mm\\:ss} / {_currentStream.TotalTime:mm\\:ss}";
+            }
         }
     }
 

@@ -70,8 +70,12 @@ public class HighResAudioService : IDisposable
     {
         if (_asioOut is not null)
         {
-            if (_asioOut.PlaybackState == PlaybackState.Playing)
-                _asioOut.Stop();
+            try 
+            {
+                if (_asioOut.PlaybackState == PlaybackState.Playing)
+                    _asioOut.Stop();
+            }
+            catch { /* Ignore exception on stop if already offline */ }
 
             _asioOut.PlaybackStopped -= OnPlaybackStopped;
             _asioOut.Dispose();
@@ -81,9 +85,23 @@ public class HighResAudioService : IDisposable
         _currentStream = null;
     }
 
+    private bool _disposed;
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!_disposed)
+        {
+            if (disposing)
+            {
+                CleanUp();
+            }
+            _disposed = true;
+        }
+    }
+
     public void Dispose()
     {
-        CleanUp();
+        Dispose(true);
         GC.SuppressFinalize(this);
     }
 }

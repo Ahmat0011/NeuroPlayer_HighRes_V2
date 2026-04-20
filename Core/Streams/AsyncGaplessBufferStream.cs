@@ -146,17 +146,31 @@ public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
         return count;
     }
 
+    private bool _disposed;
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!_disposed)
+        {
+            if (disposing)
+            {
+                _cancellationTokenSource.Cancel();
+
+                if (_bufferThread.IsAlive)
+                    _bufferThread.Join(1000);
+
+                _cancellationTokenSource.Dispose();
+                _fileReader.Dispose();
+                _bufferedWaveProvider.ClearBuffer();
+            }
+
+            _disposed = true;
+        }
+    }
+
     public void Dispose()
     {
-        _cancellationTokenSource.Cancel();
-
-        if (_bufferThread.IsAlive)
-            _bufferThread.Join(1000);
-
-        _cancellationTokenSource.Dispose();
-        _fileReader.Dispose();
-        _bufferedWaveProvider.ClearBuffer();
-
+        Dispose(true);
         GC.SuppressFinalize(this);
     }
 }
