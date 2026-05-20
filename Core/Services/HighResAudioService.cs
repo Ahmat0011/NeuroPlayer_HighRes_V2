@@ -8,6 +8,8 @@ public class HighResAudioService : IDisposable
     private AsioOut _asioOut;
     private IWaveProvider _currentStream;
 
+    public event EventHandler<string> PlaybackError;
+
     // Gibt zurück, ob das Gerät gerade abspielt
     public bool IsPlaying => _asioOut?.PlaybackState == PlaybackState.Playing;
 
@@ -60,6 +62,7 @@ public class HighResAudioService : IDisposable
         if (e.Exception is not null)
         {
             Console.WriteLine($"ASIO Playback Fehler: {e.Exception.Message}");
+            PlaybackError?.Invoke(this, e.Exception.Message);
         }
     }
 
@@ -78,7 +81,13 @@ public class HighResAudioService : IDisposable
             catch { /* Ignore exception on stop if already offline */ }
 
             _asioOut.PlaybackStopped -= OnPlaybackStopped;
-            _asioOut.Dispose();
+            
+            try
+            {
+                _asioOut.Dispose();
+            }
+            catch { /* Ignore COM/Hardware exceptions during disconnect */ }
+            
             _asioOut = null;
         }
 

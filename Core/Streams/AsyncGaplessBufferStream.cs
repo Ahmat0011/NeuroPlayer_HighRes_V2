@@ -26,7 +26,7 @@ public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
         {
             lock (_lockObj)
             {
-                return TimeSpan.FromSeconds((double)_bytesPlayed / WaveFormat.AverageBytesPerSecond);
+                return TimeSpan.FromSeconds((double)Interlocked.Read(ref _bytesPlayed) / WaveFormat.AverageBytesPerSecond);
             }
         }
         set
@@ -34,7 +34,7 @@ public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
             lock (_lockObj) // Kritischer Crash-Schutz beim Slider-Spulen!
             {
                 _fileReader.CurrentTime = value;
-                _bytesPlayed = _fileReader.Position;
+                Interlocked.Exchange(ref _bytesPlayed, _fileReader.Position);
                 _bufferedWaveProvider.ClearBuffer();
             }
         }
@@ -118,7 +118,8 @@ public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
     public int Read(byte[] buffer, int offset, int count)
     {
         // EOF STOP-SIGNAL AN NAUDIO/ASIO
-        if (!IsLooping && _bytesPlayed >= _fileReader.Length)
+        long currentBytes = Interlocked.Read(ref _bytesPlayed);
+        if (!IsLooping && currentBytes >= _fileReader.Length)
         {
             return 0;
         }
@@ -135,11 +136,12 @@ public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
             // nur bei tatsächlichen Audiodaten wächst und nicht durch Stille-Lücken (Underruns).
         }
 
-        _bytesPlayed += read;
+        Interlocked.Add(ref _bytesPlayed, read);
+        currentBytes = Interlocked.Read(ref _bytesPlayed);
 
-        if (IsLooping && _bytesPlayed >= _fileReader.Length)
+        if (IsLooping && currentBytes >= _fileReader.Length)
         {
-            _bytesPlayed %= _fileReader.Length;
+            Interlocked.Exchange(ref _bytesPlayed, currentBytes % _fileReader.Length);
         }
 
         // ASIO benötigt exakt 'count' Bytes, ob mit Audiodaten oder Stille gefüllt.

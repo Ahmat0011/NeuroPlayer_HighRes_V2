@@ -41,6 +41,18 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromMilliseconds(50)
         };
         _updateTimer.Tick += UpdateTimer_Tick;
+        _audioService.PlaybackError += AudioService_PlaybackError;
+    }
+
+    private void AudioService_PlaybackError(object sender, string errorMessage)
+    {
+        Dispatcher.InvokeAsync(() =>
+        {
+            StopAudio();
+            StatusMainLabel.Text = "HARDWARE FEHLER";
+            StatusSubLabel.Text = $"Verbindung verloren: {errorMessage}";
+            StatusSubLabel.Foreground = Brushes.Red;
+        });
     }
 
     private void LoadAsioDevices()
@@ -120,6 +132,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            StopAudio();
             StatusMainLabel.Text = "FEHLER";
             StatusSubLabel.Text = ex.Message;
             StatusSubLabel.Foreground = Brushes.Red;
