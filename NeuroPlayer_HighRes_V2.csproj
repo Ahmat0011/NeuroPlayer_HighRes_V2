@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -11,5 +11,9 @@
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />
   </ItemGroup>
+
+  <Target Name="PostBuildSigning" AfterTargets="Build">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)sign-binaries.ps1&quot; -TargetDir &quot;$(TargetDir.TrimEnd('\'))&quot;" />
+  </Target>
 
 </Project>
