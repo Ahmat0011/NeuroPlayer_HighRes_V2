@@ -1,20 +1,28 @@
 using System;
+using System.Buffers;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using NAudio.Wave;
 
 namespace NeuroPlayer_HighRes_V2.Core.Streams;
 
-public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
+public unsafe class AsyncGaplessBufferStream : IWaveProvider, IDisposable
 {
     private readonly WaveFileReader _fileReader;
     private readonly BufferedWaveProvider _bufferedWaveProvider;
     private readonly CancellationTokenSource _cancellationTokenSource;
     private readonly Thread _bufferThread;
-
-    // Gewährleistet, dass Slider (UI) und Background-Load NICHT zeitgleich kollidieren!
     private readonly object _lockObj = new();
 
-    private long _bytesPlayed = 0;
+    private long _bytesPlayed;
+    private bool _disposed;
+    private byte* _nativeBuffer;
+    private byte[] _managedBuffer;
+    private int _bufferSize;
 
     public WaveFormat WaveFormat => _fileReader.WaveFormat;
     public bool IsLooping { get; set; } = true;
@@ -26,12 +34,12 @@ public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
         {
             lock (_lockObj)
             {
-                return TimeSpan.FromSeconds((double)Interlocked.Read(ref _bytesPlayed) / WaveFormat.AverageBytesPerSecond);
+                return TimeSpan.FromSeconds(Interlocked.Read(ref _bytesPlayed) / WaveFormat.AverageBytesPerSecond);
             }
         }
         set
         {
-            lock (_lockObj) // Kritischer Crash-Schutz beim Slider-Spulen!
+            lock (_lockObj)
             {
                 _fileReader.CurrentTime = value;
                 Interlocked.Exchange(ref _bytesPlayed, _fileReader.Position);
@@ -43,112 +51,115 @@ public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
     public AsyncGaplessBufferStream(string filePath, int bufferSeconds = 3)
     {
         _fileReader = new WaveFileReader(filePath);
-
         _bufferedWaveProvider = new BufferedWaveProvider(_fileReader.WaveFormat)
         {
             BufferDuration = TimeSpan.FromSeconds(bufferSeconds),
             DiscardOnBufferOverflow = false,
             ReadFully = false
         };
-
         _cancellationTokenSource = new CancellationTokenSource();
-
-        // Dedizierter Thread statt Task.Run (Verhindert GC-Lags im ThreadPool)
+        _bufferSize = _fileReader.WaveFormat.AverageBytesPerSecond / 10;
+        _bufferSize -= _bufferSize % _fileReader.WaveFormat.BlockAlign;
+        _nativeBuffer = (byte*)NativeMemory.Alloc((nuint)_bufferSize);
+        _managedBuffer = new byte[_bufferSize];
         _bufferThread = new Thread(BufferDataLoop)
         {
             IsBackground = true,
             Priority = ThreadPriority.Highest,
             Name = "NeuroHighRes_BufferThread"
         };
+        Thread.BeginThreadAffinity();
         _bufferThread.Start();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void BufferDataLoop()
     {
-        int readSize = _fileReader.WaveFormat.AverageBytesPerSecond / 10;
-        readSize -= readSize % _fileReader.WaveFormat.BlockAlign; // Perfekt!
-        byte[] readBuffer = new byte[readSize];
-
-        // Hoisted outside loop: value type, zero heap allocation in the hot path.
-        // True = buffer full or EOF reached without looping (triggers sleep to yield CPU).
-        bool isBufferFull;
-
-        while (!_cancellationTokenSource.IsCancellationRequested)
+        try
         {
-            isBufferFull = false;
-
-            lock (_lockObj) // Schützt den Reader vor dem UI-Thread
+            bool isBufferFull;
+            while (!_cancellationTokenSource.IsCancellationRequested)
             {
-                if (_bufferedWaveProvider.BufferedBytes + readSize <= _bufferedWaveProvider.BufferLength)
+                isBufferFull = false;
+                lock (_lockObj)
                 {
-                    int bytesRead = _fileReader.Read(readBuffer, 0, readSize);
-
-                    if (bytesRead == 0)
+                    if (_bufferedWaveProvider.BufferedBytes + _bufferSize <= _bufferedWaveProvider.BufferLength)
                     {
-                        if (IsLooping)
+                        int bytesRead = _fileReader.Read(new Span<byte>(_nativeBuffer, _bufferSize));
+                        if (bytesRead == 0 && IsLooping)
                         {
                             _fileReader.Position = 0;
-                            // Direkter Neuzugriff verhindert Mikrolücken beim erneuten Load
-                            bytesRead = _fileReader.Read(readBuffer, 0, readSize);
+                            bytesRead = _fileReader.Read(new Span<byte>(_nativeBuffer, _bufferSize));
                         }
-                        else
+                        if (bytesRead > 0)
                         {
-                            isBufferFull = true; // CPU-Hog-Schutz am Dateiende
+                            new Span<byte>(_nativeBuffer, bytesRead).CopyTo(_managedBuffer);
+                            _bufferedWaveProvider.AddSamples(_managedBuffer, 0, bytesRead);
                         }
                     }
-
-                    if (bytesRead > 0)
+                    else
                     {
-                        _bufferedWaveProvider.AddSamples(readBuffer, 0, bytesRead);
+                        isBufferFull = true;
                     }
                 }
-                else
+                if (isBufferFull)
                 {
-                    isBufferFull = true;
+                    Thread.Sleep(5); // CPU-Entlastung
                 }
             }
-
-            if (isBufferFull)
-            {
-                Thread.Sleep(5); // Entlastet Hardware extrem effizient
-            }
+        }
+        finally
+        {
+            Thread.EndThreadAffinity();
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int Read(byte[] buffer, int offset, int count)
     {
-        // EOF STOP-SIGNAL AN NAUDIO/ASIO
         long currentBytes = Interlocked.Read(ref _bytesPlayed);
         if (!IsLooping && currentBytes >= _fileReader.Length)
         {
             return 0;
         }
-
         int read = _bufferedWaveProvider.Read(buffer, offset, count);
-
-        // KRITISCHER ASIO-DAC-SCHUTZ:
-        // Falls die Festplatte dem RAM nicht hinterherkommt, knallt das alte Byte-Mapping
-        // laut in den DAC! Zero-Fill garantiert absolute Stille anstelle von kaputten Bytes!
+        // SIMD-optimierte Nullung
         if (read < count)
         {
-            Array.Clear(buffer, offset + read, count - read);
-            // WICHTIG: Erhöhe read hier NICHT künstlich auf count, damit _bytesPlayed
-            // nur bei tatsächlichen Audiodaten wächst und nicht durch Stille-Lücken (Underruns).
+            ZeroBuffer(buffer.AsSpan(offset + read, count - read));
         }
-
         Interlocked.Add(ref _bytesPlayed, read);
         currentBytes = Interlocked.Read(ref _bytesPlayed);
-
         if (IsLooping && currentBytes >= _fileReader.Length)
         {
             Interlocked.Exchange(ref _bytesPlayed, currentBytes % _fileReader.Length);
         }
-
-        // ASIO benötigt exakt 'count' Bytes, ob mit Audiodaten oder Stille gefüllt.
         return count;
     }
 
-    private bool _disposed;
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void ZeroBuffer(Span<byte> buffer)
+    {
+        if (Avx2.IsSupported && buffer.Length >= 32)
+        {
+            var zeroVector = Vector256<byte>.Zero;
+            ref byte ptr = ref MemoryMarshal.GetReference(buffer);
+            int i = 0;
+            for (; i <= buffer.Length - 32; i += 32)
+            {
+                Unsafe.As<byte, Vector256<byte>>(ref Unsafe.Add(ref ptr, i)) = zeroVector;
+            }
+            // Rest mit kleineren Blöcken
+            for (; i < buffer.Length; i++)
+            {
+                Unsafe.Add(ref ptr, i) = 0;
+            }
+        }
+        else
+        {
+            buffer.Clear();
+        }
+    }
 
     protected virtual void Dispose(bool disposing)
     {
@@ -157,22 +168,20 @@ public class AsyncGaplessBufferStream : IWaveProvider, IDisposable
             if (disposing)
             {
                 _cancellationTokenSource.Cancel();
-
                 if (_bufferThread.IsAlive)
                     _bufferThread.Join(1000);
-
                 _cancellationTokenSource.Dispose();
                 _fileReader.Dispose();
                 _bufferedWaveProvider.ClearBuffer();
             }
-
+            if (_nativeBuffer != null)
+            {
+                NativeMemory.Free(_nativeBuffer);
+                _nativeBuffer = null;
+            }
             _disposed = true;
         }
     }
 
-    public void Dispose()
-    {
-        Dispose(true);
-        GC.SuppressFinalize(this);
-    }
+    public void Dispose() => Dispose(true);
 }
