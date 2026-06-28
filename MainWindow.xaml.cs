@@ -42,6 +42,7 @@ public partial class MainWindow : Window
         };
         _updateTimer.Tick += UpdateTimer_Tick;
         _audioService.PlaybackError += AudioService_PlaybackError;
+        _audioService.PlaybackStopped += AudioService_PlaybackStopped;
     }
 
     private void AudioService_PlaybackError(object sender, string errorMessage)
@@ -52,6 +53,17 @@ public partial class MainWindow : Window
             StatusMainLabel.Text = "HARDWARE FEHLER";
             StatusSubLabel.Text = $"Verbindung verloren: {errorMessage}";
             StatusSubLabel.Foreground = Brushes.Red;
+        });
+    }
+
+    private void AudioService_PlaybackStopped(object sender, EventArgs e)
+    {
+        Dispatcher.InvokeAsync(() =>
+        {
+            StopAudio();
+            StatusMainLabel.Text = "GESTOPPT";
+            StatusSubLabel.Text = "Wiedergabe beendet.";
+            StatusSubLabel.Foreground = Brushes.White;
         });
     }
 
@@ -115,12 +127,17 @@ public partial class MainWindow : Window
 
             _audioService.InitializeAsio(selectedDriver);
 
-            _currentStream = new AsyncGaplessBufferStream(_selectedFilePath, 4)
+            _currentStream = new AsyncGaplessBufferStream(_selectedFilePath)
             {
                 IsLooping = LoopCheckBox.IsChecked ?? false
             };
 
             ProgressSlider.Maximum = _currentStream.TotalTime.TotalSeconds;
+
+            var format = _currentStream.WaveFormat;
+            string bitDepthStr = format.BitsPerSample > 0 ? $"{format.BitsPerSample}-Bit" : "Unknown Bit-Depth";
+            string channelsStr = format.Channels == 1 ? "Mono" : format.Channels == 2 ? "Stereo" : $"{format.Channels} Ch";
+            FormatLabel.Text = $"{format.SampleRate / 1000.0:0.#} kHz / {bitDepthStr} / {channelsStr} | Bit-Perfect Flow";
 
             _audioService.PlayStream(_currentStream);
 
@@ -161,6 +178,7 @@ public partial class MainWindow : Window
 
         ProgressSlider.Value = 0;
         TimeLabel.Text = "00:00 / 00:00";
+        FormatLabel.Text = "192 kHz / 32-Bit Float | Zero-Latency Engine";
     }
 
     private void UpdateTimer_Tick(object sender, EventArgs e)
@@ -189,6 +207,16 @@ public partial class MainWindow : Window
         _isDragging = false;
         if (_currentStream is not null)
             _currentStream.CurrentTime = TimeSpan.FromSeconds(ProgressSlider.Value);
+    }
+
+    private void MinimizeButton_Click(object sender, RoutedEventArgs e)
+    {
+        WindowState = WindowState.Minimized;
+    }
+
+    private void CloseButton_Click(object sender, RoutedEventArgs e)
+    {
+        Close();
     }
 
     protected override void OnClosed(EventArgs e)

@@ -1,187 +1,268 @@
 using System;
-using System.Buffers;
-using System.Numerics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using NAudio.Wave;
 
 namespace NeuroPlayer_HighRes_V2.Core.Streams;
 
-public unsafe class AsyncGaplessBufferStream : IWaveProvider, IDisposable
+public sealed class AsyncGaplessBufferStream : IWaveProvider, IDisposable
 {
+    private readonly object _fileLock = new();
     private readonly WaveFileReader _fileReader;
-    private readonly BufferedWaveProvider _bufferedWaveProvider;
-    private readonly CancellationTokenSource _cancellationTokenSource;
+    private readonly WaveFormat _waveFormat;
+    private readonly TimeSpan _totalTime;
+    
+    private readonly CircularBuffer _circularBuffer;
     private readonly Thread _bufferThread;
-    private readonly object _lockObj = new();
-
+    private readonly CancellationTokenSource _cts = new();
+    
     private long _bytesPlayed;
+    private bool _eofReached;
     private bool _disposed;
-    private byte* _nativeBuffer;
-    private byte[] _managedBuffer;
-    private int _bufferSize;
 
-    public WaveFormat WaveFormat => _fileReader.WaveFormat;
+    public WaveFormat WaveFormat => _waveFormat;
     public bool IsLooping { get; set; } = true;
-    public TimeSpan TotalTime => _fileReader.TotalTime;
+    public TimeSpan TotalTime => _totalTime;
 
     public TimeSpan CurrentTime
     {
         get
         {
-            lock (_lockObj)
-            {
-                return TimeSpan.FromSeconds(Interlocked.Read(ref _bytesPlayed) / WaveFormat.AverageBytesPerSecond);
-            }
+            return TimeSpan.FromSeconds((double)Interlocked.Read(ref _bytesPlayed) / _waveFormat.AverageBytesPerSecond);
         }
         set
         {
-            lock (_lockObj)
+            lock (_fileLock)
             {
-                _fileReader.CurrentTime = value;
-                Interlocked.Exchange(ref _bytesPlayed, _fileReader.Position);
-                _bufferedWaveProvider.ClearBuffer();
+                long pos = (long)(value.TotalSeconds * _waveFormat.AverageBytesPerSecond);
+                pos = Math.Max(0, Math.Min(pos, _fileReader.Length));
+                pos -= pos % _waveFormat.BlockAlign; // Align to sample block
+                
+                _fileReader.Position = pos;
+                _circularBuffer.Clear();
+                _eofReached = false;
+                Interlocked.Exchange(ref _bytesPlayed, pos);
             }
         }
     }
 
-    public AsyncGaplessBufferStream(string filePath, int bufferSeconds = 3)
+    public AsyncGaplessBufferStream(string filePath)
     {
         _fileReader = new WaveFileReader(filePath);
-        _bufferedWaveProvider = new BufferedWaveProvider(_fileReader.WaveFormat)
-        {
-            BufferDuration = TimeSpan.FromSeconds(bufferSeconds),
-            DiscardOnBufferOverflow = false,
-            ReadFully = false
-        };
-        _cancellationTokenSource = new CancellationTokenSource();
-        _bufferSize = _fileReader.WaveFormat.AverageBytesPerSecond / 10;
-        _bufferSize -= _bufferSize % _fileReader.WaveFormat.BlockAlign;
-        _nativeBuffer = (byte*)NativeMemory.Alloc((nuint)_bufferSize);
-        _managedBuffer = new byte[_bufferSize];
-        _bufferThread = new Thread(BufferDataLoop)
+        _waveFormat = _fileReader.WaveFormat;
+        _totalTime = _fileReader.TotalTime;
+
+        // Circular buffer size: 32 MB or the file size, whichever is smaller. Aligned to BlockAlign.
+        long maxBuf = Math.Min(32 * 1024 * 1024, _fileReader.Length);
+        maxBuf -= maxBuf % _waveFormat.BlockAlign;
+        _circularBuffer = new CircularBuffer((int)maxBuf);
+
+        _bufferThread = new Thread(BufferLoop)
         {
             IsBackground = true,
-            Priority = ThreadPriority.Highest,
-            Name = "NeuroHighRes_BufferThread"
+            Priority = ThreadPriority.AboveNormal,
+            Name = "NeuroPlayer_BufferThread"
         };
-        Thread.BeginThreadAffinity();
         _bufferThread.Start();
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private void BufferDataLoop()
+    private void BufferLoop()
     {
-        try
+        byte[] tempBuffer = new byte[65536]; // 64 KB read chunks
+        while (!_cts.Token.IsCancellationRequested)
         {
-            bool isBufferFull;
-            while (!_cancellationTokenSource.IsCancellationRequested)
+            int freeSpace = _circularBuffer.FreeSpace;
+            if (freeSpace < tempBuffer.Length)
             {
-                isBufferFull = false;
-                lock (_lockObj)
+                Thread.Sleep(5);
+                continue;
+            }
+
+            int bytesToRead = Math.Min(tempBuffer.Length, freeSpace);
+            bytesToRead -= bytesToRead % _waveFormat.BlockAlign;
+            if (bytesToRead == 0)
+            {
+                Thread.Sleep(2);
+                continue;
+            }
+
+            int read = 0;
+            lock (_fileLock)
+            {
+                if (_fileReader.Position >= _fileReader.Length)
                 {
-                    if (_bufferedWaveProvider.BufferedBytes + _bufferSize <= _bufferedWaveProvider.BufferLength)
+                    if (IsLooping)
                     {
-                        int bytesRead = _fileReader.Read(new Span<byte>(_nativeBuffer, _bufferSize));
-                        if (bytesRead == 0 && IsLooping)
-                        {
-                            _fileReader.Position = 0;
-                            bytesRead = _fileReader.Read(new Span<byte>(_nativeBuffer, _bufferSize));
-                        }
-                        if (bytesRead > 0)
-                        {
-                            new Span<byte>(_nativeBuffer, bytesRead).CopyTo(_managedBuffer);
-                            _bufferedWaveProvider.AddSamples(_managedBuffer, 0, bytesRead);
-                        }
+                        _fileReader.Position = 0;
                     }
                     else
                     {
-                        isBufferFull = true;
+                        _eofReached = true;
                     }
                 }
-                if (isBufferFull)
+
+                if (!_eofReached)
                 {
-                    Thread.Sleep(5); // CPU-Entlastung
+                    read = _fileReader.Read(tempBuffer, 0, bytesToRead);
+                    if (read == 0)
+                    {
+                        if (IsLooping)
+                        {
+                            _fileReader.Position = 0;
+                            read = _fileReader.Read(tempBuffer, 0, bytesToRead);
+                        }
+                        else
+                        {
+                            _eofReached = true;
+                        }
+                    }
                 }
             }
-        }
-        finally
-        {
-            Thread.EndThreadAffinity();
-        }
-    }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int Read(byte[] buffer, int offset, int count)
-    {
-        long currentBytes = Interlocked.Read(ref _bytesPlayed);
-        if (!IsLooping && currentBytes >= _fileReader.Length)
-        {
-            return 0;
+            if (read > 0)
+            {
+                _circularBuffer.Write(tempBuffer.AsSpan(0, read));
+            }
+            else if (_eofReached && _circularBuffer.Count == 0)
+            {
+                Thread.Sleep(10);
+            }
         }
-        int read = _bufferedWaveProvider.Read(buffer, offset, count);
-        // SIMD-optimierte Nullung
-        if (read < count)
-        {
-            ZeroBuffer(buffer.AsSpan(offset + read, count - read));
-        }
-        Interlocked.Add(ref _bytesPlayed, read);
-        currentBytes = Interlocked.Read(ref _bytesPlayed);
-        if (IsLooping && currentBytes >= _fileReader.Length)
-        {
-            Interlocked.Exchange(ref _bytesPlayed, currentBytes % _fileReader.Length);
-        }
-        return count;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void ZeroBuffer(Span<byte> buffer)
+    public int Read(byte[] buffer, int offset, int count)
     {
-        if (Avx2.IsSupported && buffer.Length >= 32)
+        if (_disposed)
         {
-            var zeroVector = Vector256<byte>.Zero;
-            ref byte ptr = ref MemoryMarshal.GetReference(buffer);
-            int i = 0;
-            for (; i <= buffer.Length - 32; i += 32)
+            new Span<byte>(buffer, offset, count).Clear();
+            return 0;
+        }
+
+        int read = _circularBuffer.Read(buffer.AsSpan(offset, count));
+        Interlocked.Add(ref _bytesPlayed, read);
+
+        // Underrun handling: if the buffer is empty but we aren't at EOF, wait briefly
+        int retry = 0;
+        while (read < count && !_eofReached && !_disposed && retry < 10)
+        {
+            Thread.Sleep(2);
+            int additionalRead = _circularBuffer.Read(buffer.AsSpan(offset + read, count - read));
+            if (additionalRead > 0)
             {
-                Unsafe.As<byte, Vector256<byte>>(ref Unsafe.Add(ref ptr, i)) = zeroVector;
+                read += additionalRead;
+                Interlocked.Add(ref _bytesPlayed, additionalRead);
             }
-            // Rest mit kleineren Blöcken
-            for (; i < buffer.Length; i++)
+            retry++;
+        }
+
+        if (read < count)
+        {
+            // Fill the rest with silence
+            new Span<byte>(buffer, offset + read, count - read).Clear();
+            
+            if (_eofReached)
             {
-                Unsafe.Add(ref ptr, i) = 0;
+                return read; // Return actual read bytes to signal EOF
+            }
+            else
+            {
+                return count; // Return count to keep the ASIO stream active during brief underruns
             }
         }
-        else
+
+        return count;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        _cts.Cancel();
+        if (_bufferThread.IsAlive)
         {
-            buffer.Clear();
+            _bufferThread.Join(500);
+        }
+        _cts.Dispose();
+
+        lock (_fileLock)
+        {
+            _fileReader.Dispose();
+        }
+    }
+}
+
+// Simple thread-safe circular buffer
+internal sealed class CircularBuffer
+{
+    private readonly byte[] _buffer;
+    private int _head;
+    private int _tail;
+    private int _count;
+    private readonly object _lock = new();
+
+    public int Count { get { lock (_lock) return _count; } }
+    public int FreeSpace { get { lock (_lock) return _buffer.Length - _count; } }
+
+    public CircularBuffer(int capacity)
+    {
+        _buffer = new byte[capacity];
+    }
+
+    public int Write(ReadOnlySpan<byte> data)
+    {
+        lock (_lock)
+        {
+            int toWrite = Math.Min(data.Length, _buffer.Length - _count);
+            if (toWrite <= 0) return 0;
+
+            int firstPart = Math.Min(toWrite, _buffer.Length - _head);
+            data.Slice(0, firstPart).CopyTo(_buffer.AsSpan(_head, firstPart));
+            _head = (_head + firstPart) % _buffer.Length;
+
+            if (toWrite > firstPart)
+            {
+                int secondPart = toWrite - firstPart;
+                data.Slice(firstPart, secondPart).CopyTo(_buffer.AsSpan(_head, secondPart));
+                _head = (_head + secondPart) % _buffer.Length;
+            }
+
+            _count += toWrite;
+            return toWrite;
         }
     }
 
-    protected virtual void Dispose(bool disposing)
+    public int Read(Span<byte> dest)
     {
-        if (!_disposed)
+        lock (_lock)
         {
-            if (disposing)
+            int toRead = Math.Min(dest.Length, _count);
+            if (toRead <= 0) return 0;
+
+            int firstPart = Math.Min(toRead, _buffer.Length - _tail);
+            _buffer.AsSpan(_tail, firstPart).CopyTo(dest.Slice(0, firstPart));
+            _tail = (_tail + firstPart) % _buffer.Length;
+
+            if (toRead > firstPart)
             {
-                _cancellationTokenSource.Cancel();
-                if (_bufferThread.IsAlive)
-                    _bufferThread.Join(1000);
-                _cancellationTokenSource.Dispose();
-                _fileReader.Dispose();
-                _bufferedWaveProvider.ClearBuffer();
+                int secondPart = toRead - firstPart;
+                _buffer.AsSpan(_tail, secondPart).CopyTo(dest.Slice(firstPart, secondPart));
+                _tail = (_tail + secondPart) % _buffer.Length;
             }
-            if (_nativeBuffer != null)
-            {
-                NativeMemory.Free(_nativeBuffer);
-                _nativeBuffer = null;
-            }
-            _disposed = true;
+
+            _count -= toRead;
+            return toRead;
         }
     }
 
-    public void Dispose() => Dispose(true);
+    public void Clear()
+    {
+        lock (_lock)
+        {
+            _head = 0;
+            _tail = 0;
+            _count = 0;
+        }
+    }
 }

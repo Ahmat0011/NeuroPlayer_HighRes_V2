@@ -11,6 +11,7 @@ public sealed class HighResAudioService : IDisposable
     private bool _disposed;
 
     public event EventHandler<string> PlaybackError;
+    public event System.EventHandler PlaybackStopped;
 
     public bool IsPlaying
     {
@@ -48,6 +49,10 @@ public sealed class HighResAudioService : IDisposable
         if (e.Exception is not null)
         {
             PlaybackError?.Invoke(this, e.Exception.Message);
+        }
+        else
+        {
+            PlaybackStopped?.Invoke(this, EventArgs.Empty);
         }
     }
 
